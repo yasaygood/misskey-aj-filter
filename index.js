@@ -1,59 +1,75 @@
 // index.js
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 
+// Node 18+ なら fetch はグローバルにあります。node-fetch は不要。
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors());
 
 // ==== 環境変数 ====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // 無くても動く（フォールバック）
-const SHARED_SECRET  = process.env.SHARED_SECRET || "";  // 任意
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // 空でも動く
+const SHARED_SECRET  = process.env.SHARED_SECRET  || ""; // 任意
 
 // ==== 認証（任意） ====
 function requireAuth(req, res) {
-  if (!SHARED_SECRET) return true; // 未設定ならスキップ
+  if (!SHARED_SECRET) return true;
   const token = req.headers["x-proxy-secret"];
   if (token && token === SHARED_SECRET) return true;
   res.status(401).json({ error: "unauthorized" });
   return false;
 }
 
-// ==== OpenAI（任意）====
-async function callOpenAIChat({ model, messages, response_format }) {
+// ==== ロガー（Railway ログで見やすく） ====
+function log(...args){ console.log("[srv]", ...args); }
+function warn(...args){ console.warn("[srv]", ...args); }
+
+// ==== OpenAI 呼び出し（安全版） ====
+// 失敗しても throw しないで { ok:false, text, error } を返す
+async function safeOpenAIChat({ model = "gpt-4o-mini", messages = [], max_tokens = 800, temperature = 0 }) {
   if (!OPENAI_API_KEY) {
-    // フォールバック：OpenAI未設定なら最後のユーザ発話をそのまま返す
     const last = messages[messages.length - 1]?.content || "";
-    return String(last);
+    return { ok: false, text: String(last), error: "NO_OPENAI_KEY" };
   }
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: model || "gpt-4o-mini",
-      messages,
-      temperature: 0,          // 安定重視
-      max_tokens: 800,
-      ...(response_format ? { response_format } : {}),
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    const msg = j?.error?.message || `OpenAI HTTP ${r.status}`;
-    throw new Error(msg);
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, messages, max_tokens, temperature }),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      warn("OpenAI error", r.status, j?.error?.message);
+      return { ok: false, text: messages[messages.length - 1]?.content || "", error: j?.error?.message || `HTTP ${r.status}` };
+    }
+    const text = j?.choices?.[0]?.message?.content || "";
+    return { ok: true, text };
+  } catch (e) {
+    warn("OpenAI fetch failed", e?.message || e);
+    return { ok: false, text: messages[messages.length - 1]?.content || "", error: String(e?.message || e) };
   }
-  return j?.choices?.[0]?.message?.content || "";
+}
+
+// ==== 簡易きれい化（OpenAI 不可時のフォールバック） ====
+function soften(text) {
+  if (!text) return text;
+  // 代表的な暴言をやわらげる（最低限の例）
+  return String(text)
+    .replace(/(死ね|ﾀﾋね)/g, "つらい")
+    .replace(/(ばか|バカ|馬鹿|アホ|クズ|カス)/g, "よくない")
+    .replace(/(ぶっ殺|殺す)/g, "怒ってる")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 // ==== ルート ====
 app.get("/", (_req, res) => res.send("AI proxy up"));
 app.get("/health", (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-// ---- Chat：任意の会話/リライト用（VMの投稿クリーン化で使用）----
+// ---- Chat（任意）----
 app.post("/chat", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
@@ -61,10 +77,13 @@ app.post("/chat", async (req, res) => {
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages required" });
     }
-    const reply = await callOpenAIChat({ model, messages });
-    res.json({ reply });
+    const r = await safeOpenAIChat({ model, messages, temperature: 0 });
+    // 失敗しても200で返す（UIを止めない）
+    res.json({ reply: r.text, openai_ok: r.ok, error: r.ok ? undefined : r.error });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    // ここには基本来ないが、来ても 200 で最低限返す
+    warn("/chat fatal", e?.message || e);
+    res.json({ reply: messages?.[messages.length - 1]?.content || "", openai_ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -77,13 +96,11 @@ app.post("/analyze", (req, res) => {
   const dislike= new Set(req.body?.dislike_tokens || []);
   const level  = String(req.body?.level || "moderate"); // relaxed|moderate|strict
 
-  // ざっくりルール（ローカルTL向けの安全寄り）
   const rx = {
     profanity: /(死ね|殺す|バカ|馬鹿|アホ|クズ|カス|消えろ|キモ|最悪|○ね|ぶっ殺|fuck|shit|bitch)/i,
     sexual   : /(セックス|sex|エロ|ちん|まん|乳|レイプ|エッチ)/i,
-    spamNoise: /([ぁ-んァ-ンｦ-ﾟa-zA-Z0-9])\1{6,}|[ぁあー]{6,}/i, // 発狂・連呼
-    emoji    : /[\u{1F600}-\u{1F6FF}\u{1F300}-\u{1FAFF}]/u,    // 参考：絵文字
-    emptyRp  : /^(\s*@\S+\s*|[#＃]\S+\s*|https?:\/\/\S+\s*)+$/i // 空中リプ/タグ・URLだけ
+    spamNoise: /([ぁ-んァ-ンｦ-ﾟa-zA-Z0-9])\1{6,}|[ぁあー]{6,}/i,
+    emptyRp  : /^(\s*@\S+\s*|[#＃]\S+\s*|https?:\/\/\S+\s*)+$/i
   };
 
   const likeWords = [...like].map(s=>String(s).toLowerCase()).filter(Boolean);
@@ -93,9 +110,8 @@ app.post("/analyze", (req, res) => {
     const t = String(text || "");
     const low = t.toLowerCase();
 
-    // 学習優先
     for (const w of dislikeWords) if (w && low.includes(w)) return "hide";
-    // レベル強いほど hide 範囲を広げる
+
     const hitProf = rx.profanity.test(t) || rx.sexual.test(t);
     const hitSpam = rx.spamNoise.test(t);
     const hitEmpty= rx.emptyRp.test(t);
@@ -106,14 +122,11 @@ app.post("/analyze", (req, res) => {
       if (hitProf || hitEmpty) return "hide";
       if (hitSpam) return "rewrite";
     } else {
-      // relaxed
       if (hitProf) return "hide";
       if (hitSpam || hitEmpty) return "rewrite";
     }
 
-    // like は rewrite 推奨（軽くジョーク化等）
     for (const w of likeWords) if (w && low.includes(w)) return "rewrite";
-
     return "keep";
   }
 
@@ -122,7 +135,7 @@ app.post("/analyze", (req, res) => {
   res.json({ results: out });
 });
 
-// ---- Rewrite：{results:{id:"書き換え後"}}（AJなど）----
+// ---- Rewrite：{results:{id:"書き換え後"}}（AJ/クリーン化）----
 app.post("/rewrite", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
@@ -134,27 +147,44 @@ app.post("/rewrite", async (req, res) => {
       const original = String(it?.text || "");
       let rewritten = original;
 
-      if (OPENAI_API_KEY) {
-        // スタイル別の system 指示
-        const system =
-          style.indexOf("american_joke") >= 0
-            ? "日本語の投稿を短いアメリカンジョーク調に。攻撃性を和らげ、意味は保ち、最後に軽い落ち。日本語のみ。"
-            : `日本語の投稿を「${style}」の雰囲気に。攻撃性を和らげ、意味は保つ。日本語のみ。`;
+      // OpenAI へ挑戦 → ダメでもフォールバックして続行
+      const system =
+        style.indexOf("american_joke") >= 0
+          ? "日本語の投稿を短いアメリカンジョーク調に。攻撃性を和らげ、意味は保ち、最後に軽い落ち。日本語のみ。"
+          : `日本語の投稿を「${style}」の雰囲気に。攻撃性を和らげ、意味は保つ。日本語のみ。`;
 
-        const prompt = [
+      const r = await safeOpenAIChat({
+        model: "gpt-4o-mini",
+        messages: [
           { role: "system", content: system },
           { role: "user", content: original }
-        ];
-        rewritten = await callOpenAIChat({ messages: prompt });
+        ],
+        temperature: 0.2,
+        max_tokens: 400
+      });
+
+      if (r.ok && r.text && r.text.trim()) {
+        rewritten = r.text.trim();
+      } else {
+        // フォールバック（簡易きれい化 or そのまま）
+        rewritten = style.indexOf("american_joke") >= 0
+          ? soften(original) + "（※軽変換）"
+          : soften(original);
       }
       out[it.id] = rewritten;
     }
+    // ここまで来たら必ず 200
     res.json({ results: out });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    // 何があっても 200 で原文返す（UIを止めない）
+    warn("/rewrite fatal", e?.message || e);
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const out = {};
+    for (const it of items) out[it.id] = String(it?.text || "");
+    res.json({ results: out, degraded: true, error: String(e?.message || e) });
   }
 });
 
 // ==== 起動 ====
-const PORT = process.env.PORT || 8080; // Railway でもOK
-app.listen(PORT, () => console.log(`✅ server up on :${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => log(`✅ server up on :${PORT}`));
