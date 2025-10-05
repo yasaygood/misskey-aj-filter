@@ -15,7 +15,7 @@ if (!OPENAI_API_KEY) {
 }
 const SHARED_SECRET = process.env.SHARED_SECRET || ""; // 任意
 
-// ==== 共通 ====
+// ==== 認証（任意） ====
 function requireAuth(req, res) {
   if (!SHARED_SECRET) return true;
   const token = req.headers["x-proxy-secret"];
@@ -24,8 +24,8 @@ function requireAuth(req, res) {
   return false;
 }
 
-async function openAIChatJSON({ model, messages }) {
-  // JSON を厳格に返させる
+// ==== OpenAI 呼び出し（chat.completions）====
+async function callOpenAIChat({ model, messages, response_format }) {
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -34,33 +34,10 @@ async function openAIChatJSON({ model, messages }) {
     },
     body: JSON.stringify({
       model,
+      messages,
       temperature: 0,
-      response_format: { type: "json_object" },
-      messages,
-      max_tokens: 1800,
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    const msg = j?.error?.message || `OpenAI HTTP ${r.status}`;
-    throw new Error(msg);
-  }
-  const content = j?.choices?.[0]?.message?.content || "{}";
-  return JSON.parse(content);
-}
-
-async function openAIChatText({ model, messages }) {
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.6,
-      messages,
-      max_tokens: 1800,
+      max_tokens: 1500,
+      ...(response_format ? { response_format } : {}),
     }),
   });
   const j = await r.json();
@@ -75,146 +52,78 @@ async function openAIChatText({ model, messages }) {
 app.get("/", (_req, res) => res.send("✅ AI proxy up"));
 app.get("/health", (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-// ==== 既存の chat ====
+// ==== Chat（そのまま残す）====
 app.post("/chat", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
     const { messages, model = "gpt-4o-mini" } = req.body;
     if (!messages) return res.status(400).json({ error: "messages is required" });
-    const reply = await openAIChatText({ model, messages });
-    res.json({ reply });
+    const result = await callOpenAIChat({ model, messages });
+    res.json({ reply: result });
   } catch (e) {
     console.error("❌ /chat error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ==== analyze: テキスト群に keep/hide/rewrite を付与 ====
+// ==== Analyze（VMの /analyze 呼び出し用）====
 app.post("/analyze", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
-    const {
-      items = [],                   // [{ id, text }]
-      like_tokens = [],             // ["かわいい", ...]
-      dislike_tokens = [],          // ["グロ", ...]
-      level = "moderate",           // relaxed | moderate | strict
-      model = "gpt-4o-mini"
-    } = req.body;
+    const { items = [], level = "moderate", like_tokens = [], dislike_tokens = [] } = req.body;
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.json({ results: {} });
-    }
+    const sys = `Misskeyノートのテキストを評価し、JSONオブジェクトで返す。
+- key: 受け取った id
+- value: { suggest: "keep"|"rewrite"|"hide" }
 
-    // まず軽いローカル判定（高速・省コスト）
-    const fastMap = {};
-    const dl = new Set(dislike_tokens.filter(Boolean).map(String));
-    const ll = new Set(like_tokens.filter(Boolean).map(String));
+判定指針:
+- 強い罵倒/攻撃/性表現/露骨な下ネタ/差別/ハラスメント/連投的発狂（例: ああああ）があれば "hide"
+- 皮肉/ネガ/空中リプ（具体指し示しが薄い@だけ等）は "rewrite" 推奨
+- それ以外は "keep"
 
-    const hitToken = (text, bag) => {
-      const t = (text || "").toLowerCase();
-      for (const w of bag) {
-        if (!w) continue;
-        if (t.includes(String(w).toLowerCase())) return true;
-      }
-      return false;
-    };
+レベル:
+- relaxed: hideを弱め、rewrite多め
+- moderate: バランス
+- strict: hideを強め
 
-    for (const it of items) {
-      const text = String(it.text || "");
-      if (!text.trim()) { fastMap[it.id] = { suggest: "keep" }; continue; }
-      if (hitToken(text, dl)) { fastMap[it.id] = { suggest: "hide", reason: "dislike_token" }; continue; }
-      fastMap[it.id] = { suggest: "keep" };
-    }
+学習トークン:
+- like_tokens に近い文面は keep 寄り
+- dislike_tokens に近い文面は hide/rewrite 寄り
 
-    // OpenAI できめ細かい最終判定（JSON で返させる）
-    // 失敗したら fastMap を返すフェイルセーフ
-    let finalMap = fastMap;
-    try {
-      const sys = {
-        role: "system",
-        content:
-          "You are a safety/content triage. For each item, output JSON {results:{<id>:{suggest}}}. " +
-          "suggest ∈ {keep, hide, rewrite}. " +
-          "Consider tone/toxicity/NSFW. Level 'strict' → hide more, 'relaxed' → hide less. " +
-          "Prefer 'hide' for spam/hate/NSFW/very offensive. Use 'rewrite' for mildly toxic or negative that can be softened. " +
-          "Output JSON only."
-      };
-      const user = {
-        role: "user",
-        content: JSON.stringify({
-          level,
-          items,
-          like_tokens,
-          dislike_tokens
-        })
-      };
-      const json = await openAIChatJSON({ model, messages: [sys, user] });
-      if (json && json.results && typeof json.results === "object") {
-        finalMap = json.results;
-      }
-    } catch (e) {
-      console.warn("⚠️ /analyze: fallback to fastMap:", e.message);
-    }
+必ず純粋なJSONのみを返す。`;
 
-    res.json({ results: finalMap });
+    const user = JSON.stringify({
+      level,
+      like_tokens,
+      dislike_tokens,
+      items, // [{id,text}]
+    });
+
+    const raw = await callOpenAIChat({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+      response_format: { type: "json_object" },
+    });
+
+    const parsed = JSON.parse(raw);
+    // もしモデルが {"a1":"hide"} 形式で返したら包む
+    const results = parsed.results ? parsed.results : parsed;
+    res.json({ results });
   } catch (e) {
     console.error("❌ /analyze error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ==== rewrite: テキスト群をスタイル指定でリライト ====
+// ==== Rewrite（VMの /rewrite 呼び出し用）====
 app.post("/rewrite", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
-    const {
-      items = [],                   // [{ id, text }]
-      style = "american_joke: witty, playful, short; keep meaning; soften negativity; light gag",
-      model = "gpt-4o-mini"
-    } = req.body;
-
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.json({ results: {} });
-    }
-
-    const sys = {
-      role: "system",
-      content:
-        "Rewrite short social posts. Keep original meaning, make it concise. " +
-        "Apply the given style. Output JSON {results:{<id>: <rewrittenText>}} only."
-    };
-    const user = {
-      role: "user",
-      content: JSON.stringify({ style, items })
-    };
-
-    let json;
-    try {
-      json = await openAIChatJSON({ model, messages: [sys, user] });
-    } catch (e) {
-      // JSONモード失敗時のフォールバック（テキスト→JSON化）
-      const txt = await openAIChatText({ model, messages: [sys, user] });
-      try { json = JSON.parse(txt); } catch { json = { results: {} }; }
-    }
-
-    const results = (json && json.results && typeof json.results === "object")
-      ? json.results
-      : {};
-
-    // 念のため: 足りないidはパススルー
-    for (const it of items) {
-      if (typeof results[it.id] !== "string") {
-        results[it.id] = it.text;
-      }
-    }
-
-    res.json({ results });
-  } catch (e) {
-    console.error("❌ /rewrite error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ==== 起動 ====
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+    const { style = "american_joke", items = [] } = req.body; // [{id,text}]
+    const sys =
+      style.indexOf("american_joke") >= 0
+        ? `次の各テキストを短いアメリカンジョーク調に。否定性はやわらげ、意味は保つ。最後は軽い落ち。JSONで {id:text} 形式だけ返す。`
+        : `次の各テキストを指定
