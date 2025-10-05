@@ -1,190 +1,262 @@
-// index.js
+// index.js — Stable AI proxy with persistent learning store (JSON file)
 import express from "express";
 import cors from "cors";
+import fetch from "node-fetch";
+import { promises as fs } from "fs";
+import path from "path";
 
-// Node 18+ なら fetch はグローバルにあります。node-fetch は不要。
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors());
 
-// ==== 環境変数 ====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // 空でも動く
-const SHARED_SECRET  = process.env.SHARED_SECRET  || ""; // 任意
+// ===== Env =====
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const SHARED_SECRET  = process.env.SHARED_SECRET  || "";
+const PORT           = process.env.PORT || 8080;
+const LEARN_PATH     = process.env.LEARN_PATH || path.resolve("./learn.json");
 
-// ==== 認証（任意） ====
-function requireAuth(req, res) {
+// ===== Auth helper =====
+function okAuth(req, res) {
   if (!SHARED_SECRET) return true;
   const token = req.headers["x-proxy-secret"];
   if (token && token === SHARED_SECRET) return true;
   res.status(401).json({ error: "unauthorized" });
   return false;
 }
+const toStr = (x)=> (x==null ? "" : String(x));
+const take  = (arr,n)=> Array.isArray(arr) ? arr.slice(0,n) : [];
 
-// ==== ロガー（Railway ログで見やすく） ====
-function log(...args){ console.log("[srv]", ...args); }
-function warn(...args){ console.warn("[srv]", ...args); }
-
-// ==== OpenAI 呼び出し（安全版） ====
-// 失敗しても throw しないで { ok:false, text, error } を返す
-async function safeOpenAIChat({ model = "gpt-4o-mini", messages = [], max_tokens = 800, temperature = 0 }) {
-  if (!OPENAI_API_KEY) {
-    const last = messages[messages.length - 1]?.content || "";
-    return { ok: false, text: String(last), error: "NO_OPENAI_KEY" };
-  }
-  try {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model, messages, max_tokens, temperature }),
-    });
-    const j = await r.json();
-    if (!r.ok) {
-      warn("OpenAI error", r.status, j?.error?.message);
-      return { ok: false, text: messages[messages.length - 1]?.content || "", error: j?.error?.message || `HTTP ${r.status}` };
+// ===== Persistent learning store =====
+const Learn = {
+  like:    new Set(),
+  dislike: new Set(),
+  _dirty:  false,
+  async load() {
+    try {
+      const raw = await fs.readFile(LEARN_PATH, "utf8");
+      const j = JSON.parse(raw);
+      this.like    = new Set(Array.isArray(j.like_tokens)    ? j.like_tokens    : []);
+      this.dislike = new Set(Array.isArray(j.dislike_tokens) ? j.dislike_tokens : []);
+      this._dirty = false;
+      // console.log("Loaded learn store:", this.like.size, this.dislike.size);
+    } catch {
+      // 初回はファイルが無くてもOK
+      this.like = new Set(); this.dislike = new Set(); this._dirty = true;
+      await this.save(); // 空で作る
     }
-    const text = j?.choices?.[0]?.message?.content || "";
-    return { ok: true, text };
-  } catch (e) {
-    warn("OpenAI fetch failed", e?.message || e);
-    return { ok: false, text: messages[messages.length - 1]?.content || "", error: String(e?.message || e) };
+  },
+  async save() {
+    if (!this._dirty) return;
+    const data = JSON.stringify({
+      like_tokens:    [...this.like],
+      dislike_tokens: [...this.dislike],
+      saved_at: Date.now()
+    });
+    await fs.writeFile(LEARN_PATH, data, "utf8");
+    this._dirty = false;
+  },
+  addLike(arr){ for (const w of (arr||[])) { const t=toStr(w).trim(); if (t) this.like.add(t); } this._dirty = true; },
+  addDislike(arr){ for (const w of (arr||[])) { const t=toStr(w).trim(); if (t) this.dislike.add(t); } this._dirty = true; },
+  export(){ return { like_tokens: [...this.like], dislike_tokens: [...this.dislike] }; },
+  async reset(){ this.like.clear(); this.dislike.clear(); this._dirty = true; await this.save(); }
+};
+
+// 定期フラッシュ（書き込みをまとめる）
+setInterval(()=>{ Learn.save().catch(()=>{}); }, 3000);
+
+// 起動時ロード
+await Learn.load().catch(()=>{});
+
+// ===== OpenAI wrapper =====
+async function callOpenAIChat({ model, messages, response_format }) {
+  if (!OPENAI_API_KEY) {
+    // OpenAI未設定ならフォールバック：最後のuser発話を返す
+    const last = messages[messages.length - 1]?.content || "";
+    return toStr(last);
   }
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: model || "gpt-4o-mini",
+      messages,
+      temperature: 0.4,
+      max_tokens: 1500,
+      ...(response_format ? { response_format } : {}),
+    }),
+  });
+  const j = await r.json();
+  if (!r.ok) {
+    const msg = j?.error?.message || `OpenAI HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return j?.choices?.[0]?.message?.content || "";
 }
 
-// ==== 簡易きれい化（OpenAI 不可時のフォールバック） ====
-function soften(text) {
-  if (!text) return text;
-  // 代表的な暴言をやわらげる（最低限の例）
-  return String(text)
-    .replace(/(死ね|ﾀﾋね)/g, "つらい")
-    .replace(/(ばか|バカ|馬鹿|アホ|クズ|カス)/g, "よくない")
-    .replace(/(ぶっ殺|殺す)/g, "怒ってる")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-// ==== ルート ====
-app.get("/", (_req, res) => res.send("AI proxy up"));
+// ===== Health =====
+app.get("/", (_req, res) => res.send("✅ AI proxy up (persistent)"));
 app.get("/health", (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-// ---- Chat（任意）----
-app.post("/chat", async (req, res) => {
-  if (!requireAuth(req, res)) return;
-  try {
-    const { model = "gpt-4o-mini", messages = [] } = req.body || {};
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: "messages required" });
-    }
-    const r = await safeOpenAIChat({ model, messages, temperature: 0 });
-    // 失敗しても200で返す（UIを止めない）
-    res.json({ reply: r.text, openai_ok: r.ok, error: r.ok ? undefined : r.error });
-  } catch (e) {
-    // ここには基本来ないが、来ても 200 で最低限返す
-    warn("/chat fatal", e?.message || e);
-    res.json({ reply: messages?.[messages.length - 1]?.content || "", openai_ok: false, error: String(e?.message || e) });
-  }
+// ===== Learning API =====
+// クライアントから来た好き/嫌い語をサーバーにも永続蓄積
+app.post("/learn", async (req, res) => {
+  if (!okAuth(req, res)) return;
+  const likeArr    = take(req.body?.like, 200);
+  const dislikeArr = take(req.body?.dislike, 200);
+  Learn.addLike(likeArr);
+  Learn.addDislike(dislikeArr);
+  await Learn.save().catch(()=>{});
+  res.json({ ok: true, ...Learn.export(), path: LEARN_PATH });
 });
 
-// ---- Analyze：{results:{id:{suggest:"keep|hide|rewrite"}}} ----
+app.get("/learn", (_req, res) => {
+  res.json({ ok: true, ...Learn.export(), path: LEARN_PATH });
+});
+
+app.post("/learn/reset", async (req, res) => {
+  if (!okAuth(req, res)) return;
+  await Learn.reset().catch(()=>{});
+  res.json({ ok: true, ...Learn.export(), path: LEARN_PATH });
+});
+
+// ===== Analyze（簡易判定 + 学習反映） =====
+// 入力: { items:[{id,text}], like_tokens?:[], dislike_tokens?:[] }
+// 出力: { results: { [id]: { suggest:"keep"|"hide"|"rewrite" } } }
 app.post("/analyze", (req, res) => {
-  if (!requireAuth(req, res)) return;
+  if (!okAuth(req, res)) return;
 
-  const items = Array.isArray(req.body?.items) ? req.body.items : [];
-  const like   = new Set(req.body?.like_tokens || []);
-  const dislike= new Set(req.body?.dislike_tokens || []);
-  const level  = String(req.body?.level || "moderate"); // relaxed|moderate|strict
+  const items    = take(req.body?.items, 50);
+  const likeIn   = new Set((req.body?.like_tokens    || []).map(toStr));
+  const dislikeIn= new Set((req.body?.dislike_tokens || []).map(toStr));
 
-  const rx = {
-    profanity: /(死ね|殺す|バカ|馬鹿|アホ|クズ|カス|消えろ|キモ|最悪|○ね|ぶっ殺|fuck|shit|bitch)/i,
-    sexual   : /(セックス|sex|エロ|ちん|まん|乳|レイプ|エッチ)/i,
-    spamNoise: /([ぁ-んァ-ンｦ-ﾟa-zA-Z0-9])\1{6,}|[ぁあー]{6,}/i,
-    emptyRp  : /^(\s*@\S+\s*|[#＃]\S+\s*|https?:\/\/\S+\s*)+$/i
-  };
-
-  const likeWords = [...like].map(s=>String(s).toLowerCase()).filter(Boolean);
-  const dislikeWords = [...dislike].map(s=>String(s).toLowerCase()).filter(Boolean);
-
-  function decide(text) {
-    const t = String(text || "");
-    const low = t.toLowerCase();
-
-    for (const w of dislikeWords) if (w && low.includes(w)) return "hide";
-
-    const hitProf = rx.profanity.test(t) || rx.sexual.test(t);
-    const hitSpam = rx.spamNoise.test(t);
-    const hitEmpty= rx.emptyRp.test(t);
-
-    if (level === "strict") {
-      if (hitProf || hitSpam || hitEmpty) return "hide";
-    } else if (level === "moderate") {
-      if (hitProf || hitEmpty) return "hide";
-      if (hitSpam) return "rewrite";
-    } else {
-      if (hitProf) return "hide";
-      if (hitSpam || hitEmpty) return "rewrite";
-    }
-
-    for (const w of likeWords) if (w && low.includes(w)) return "rewrite";
-    return "keep";
-  }
+  // クライアント提供 + サーバー学習 を合成
+  const likeAll    = new Set([...likeIn,    ...Learn.like]);
+  const dislikeAll = new Set([...dislikeIn, ...Learn.dislike]);
 
   const out = {};
-  for (const it of items) out[it.id] = { suggest: decide(it?.text) };
+  for (const it of items) {
+    const id   = toStr(it?.id) || ("h" + Math.random().toString(36).slice(2));
+    const text = toStr(it?.text || "");
+    const low  = text.toLowerCase();
+
+    let suggest = "keep";
+
+    // 学習「嫌い」語 → hide に寄せる
+    for (const w of dislikeAll) {
+      if (w && low.includes(String(w).toLowerCase())) { suggest = "hide"; break; }
+    }
+
+    // 簡易の不快語ヒント
+    const badHints = [
+      "死ね","バカ","クソ","最悪","消えろ","ムカつく","キモい","うざい","ぶっ殺",
+      "fuck","shit","idiot","moron","kill you"
+    ];
+    if (suggest === "keep") {
+      for (const w of badHints) {
+        if (low.includes(w.toLowerCase())) { suggest = "hide"; break; }
+      }
+    }
+
+    // 学習「好き」語 → rewrite へ（丁寧化やAJのターゲットへ送れる）
+    if (suggest === "keep") {
+      for (const w of likeAll) {
+        if (w && low.includes(String(w).toLowerCase())) { suggest = "rewrite"; break; }
+      }
+    }
+
+    out[id] = { suggest };
+  }
+
   res.json({ results: out });
 });
 
-// ---- Rewrite：{results:{id:"書き換え後"}}（AJ/クリーン化）----
+// ===== Rewrite（校閲/AJ） =====
+// 入力: { style:"polish"|"american_joke"|..., items:[{id,text}] }
+// 出力: { results:{ [id]:"書き換え後" } }
 app.post("/rewrite", async (req, res) => {
-  if (!requireAuth(req, res)) return;
+  if (!okAuth(req, res)) return;
   try {
-    const style = String(req.body?.style || "american_joke").slice(0, 200);
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    const out = {};
+    const style = toStr(req.body?.style || "polish").slice(0, 200).toLowerCase();
+    const items = take(req.body?.items, 40);
 
-    for (const it of items) {
-      const original = String(it?.text || "");
-      let rewritten = original;
+    const joined = items
+      .map(it => `${toStr(it?.id)}::: ${toStr(it?.text)}`.slice(0, 4000))
+      .join("\n\n")
+      .slice(0, 16000);
 
-      // OpenAI へ挑戦 → ダメでもフォールバックして続行
-      const system =
-        style.indexOf("american_joke") >= 0
-          ? "日本語の投稿を短いアメリカンジョーク調に。攻撃性を和らげ、意味は保ち、最後に軽い落ち。日本語のみ。"
-          : `日本語の投稿を「${style}」の雰囲気に。攻撃性を和らげ、意味は保つ。日本語のみ。`;
+    if (!joined.trim()) return res.json({ results: {} });
 
-      const r = await safeOpenAIChat({
+    let sys = "";
+    if (style.includes("american_joke")) {
+      sys = "あなたは日本語のジョーク作家です。各入力（id::: text）を短く軽快なアメリカンジョーク風に、攻撃性を避けつつ意味を保って書き換え、JSONオブジェクト（{\"id\":\"変換後\"...}）のみ返してください。";
+    } else {
+      sys = "あなたは日本語の編集者です。各入力（id::: text）を自然で丁寧に穏やかに校閲し、攻撃的表現は和らげて、JSONオブジェクト（{\"id\":\"変換後\"...}）のみ返してください。";
+    }
+
+    let content;
+    try {
+      content = await callOpenAIChat({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: system },
-          { role: "user", content: original }
-        ],
-        temperature: 0.2,
-        max_tokens: 400
+          { role: "system", content: sys },
+          { role: "user",   content: joined }
+        ]
       });
-
-      if (r.ok && r.text && r.text.trim()) {
-        rewritten = r.text.trim();
-      } else {
-        // フォールバック（簡易きれい化 or そのまま）
-        rewritten = style.indexOf("american_joke") >= 0
-          ? soften(original) + "（※軽変換）"
-          : soften(original);
-      }
-      out[it.id] = rewritten;
+    } catch (e) {
+      // フォールバック：原文
+      const out = {};
+      for (const it of items) out[toStr(it?.id)] = toStr(it?.text || "");
+      return res.json({ results: out, fallback: true, error: toStr(e.message || e) });
     }
-    // ここまで来たら必ず 200
-    res.json({ results: out });
+
+    let parsed = {};
+    try { parsed = JSON.parse(content); }
+    catch (_e) {
+      const out = {};
+      for (const it of items) out[toStr(it?.id)] = toStr(it?.text || "");
+      return res.json({ results: out, fallback: true, parse_error: true, raw: content });
+    }
+
+    const results = {};
+    for (const it of items) {
+      const id = toStr(it?.id);
+      const v  = toStr(parsed[id]);
+      results[id] = v || toStr(it?.text || "");
+    }
+    res.json({ results });
   } catch (e) {
-    // 何があっても 200 で原文返す（UIを止めない）
-    warn("/rewrite fatal", e?.message || e);
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    const out = {};
-    for (const it of items) out[it.id] = String(it?.text || "");
-    res.json({ results: out, degraded: true, error: String(e?.message || e) });
+    res.status(500).json({ error: toStr(e.message || e) });
   }
 });
 
-// ==== 起動 ====
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => log(`✅ server up on :${PORT}`));
+// ===== 1件用（投稿前にサッと変換） =====
+app.post("/rewrite-post", async (req, res) => {
+  if (!okAuth(req, res)) return;
+  try {
+    const text = toStr(req.body?.text || "");
+    const mode = toStr(req.body?.mode || "polish").toLowerCase();
+    if (!text.trim()) return res.json({ text: "" });
+
+    const sys = mode.includes("american_joke")
+      ? "短く軽快なアメリカンジョーク風。意味は保ち、攻撃的表現は避け、軽いオチで締める。日本語で。"
+      : "攻撃的/下品/暴言を和らげ、自然で丁寧な日本語に校閲する。意味は保つ。";
+
+    const out = await callOpenAIChat({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: sys },
+        { role: "user",   content: text }
+      ]
+    });
+
+    res.json({ text: toStr(out) });
+  } catch (e) {
+    res.status(500).json({ error: toStr(e.message || e) });
+  }
+});
+
+// ===== Start =====
+app.listen(PORT, () => console.log(`✅ server up on :${PORT}, learn=${LEARN_PATH}`));
