@@ -20,10 +20,10 @@ function requireAuth(req, res) {
   return false;
 }
 
-// ==== OpenAI 呼び出し（任意） ====
-async function callOpenAIChat({ model = "gpt-4o-mini", messages }) {
+// ==== OpenAI 呼び出し ====
+async function callOpenAIChat({ model = "gpt-4o-mini", messages, temperature = 0.4, max_tokens = 800 }) {
   if (!OPENAI_API_KEY) {
-    // 未設定のときはここは使わず、下のローカル変換にフォールバック
+    // キー未設定：ここではエラーにせず、最後のユーザー発話をそのまま返す
     const last = messages[messages.length - 1]?.content || "";
     return String(last);
   }
@@ -33,12 +33,7 @@ async function callOpenAIChat({ model = "gpt-4o-mini", messages }) {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.4,
-      max_tokens: 800,
-    }),
+    body: JSON.stringify({ model, messages, temperature, max_tokens }),
   });
   const j = await r.json();
   if (!r.ok) {
@@ -50,6 +45,8 @@ async function callOpenAIChat({ model = "gpt-4o-mini", messages }) {
 
 /* =========================
    ローカル変換（フォールバック）
+   ※ べらんめえ等はサーバでは行わず、
+      OpenAIキー未設定時は「原文そのまま」を返します。
    ========================= */
 const PROFANITY = [
   /死ね/g, /殺す/g, /バカ/g, /ばか/g, /馬鹿/g, /アホ/g, /くそ/g, /クソ/g,
@@ -57,13 +54,9 @@ const PROFANITY = [
 ];
 function softenJapanese(text) {
   let t = String(text || "");
-
-  // 絵文字/連続記号の減衰
   t = t.replace(/([!！?？。]){2,}/g, "$1");
   t = t.replace(/([wW]){3,}/g, "w");
   t = t.replace(/[\u{1F300}-\u{1FAFF}]{3,}/gu, "🙂");
-
-  // 罵倒語を穏やかに
   t = t.replace(/死ね/g, "やめてほしいです")
        .replace(/殺す/g, "本当に困ります")
        .replace(/(バカ|ばか|馬鹿)/g, "よくないと思います")
@@ -76,22 +69,13 @@ function softenJapanese(text) {
        .replace(/最悪/g, "あまり良くないです")
        .replace(/ゴミ/g, "満足できません")
        .replace(/うざ/g, "少し困っています");
-
-  // 断定をやわらげる（軽め）
-  t = t.replace(/だよね$/g, "だよね。")
-       .replace(/だよ$/g, "だと思います。")
-       .replace(/だ$/g, "だと思います。");
-
-  // 語尾を丁寧に（乱暴な文っぽいときだけ）
   if (/^[^。！？\n]{2,}$/.test(t)) t += "。";
   t = t.replace(/！/g, "。").replace(/!+/g, "。");
-
   return t;
 }
 
 function toAmericanJokeLine(jp) {
   const base = softenJapanese(jp);
-  // すでに十分短い時は軽く一行ボケ
   const addOns = [
     "…てことで、今日の私には追い風をください。",
     "— でもコーヒーは美味しかったのでチャラです。",
@@ -125,45 +109,105 @@ app.post("/analyze", (req, res) => {
   res.json({ results: out });
 });
 
-// 書き換えAPI：{results:{id:"書き換え後"}}
+/* -------------- 方言プリセット -------------- */
+const DIALECTS = {
+  beranmee: "江戸っ子『べらんめえ』口調で、荒っぽく陽気に。語尾は〜だぜ/〜だな/〜しな等。暴言や誹謗中傷はしない。",
+  kansai:   "関西弁で、柔らかめの会話調。〜やで/〜やん/〜してな等。きつ過ぎないトーン。",
+  hakata:   "博多弁。親しみやすく柔らかい調子。",
+  tohoku:   "東北訛りを感じるやさしい語り口。",
+  nagoya:   "名古屋弁のニュアンスを軽く添える口調。",
+  okinawa:  "沖縄方言の雰囲気を穏やかに織り交ぜる口調。",
+  random:   "上記のいずれかを自然に選び、崩しすぎず読みやすく。"
+};
+const PLACEHOLDER_GUARD =
+  "テキスト中のURL・@メンション・#ハッシュタグ・絵文字などのプレースホルダは削除/改変せず、位置もできるだけ保ってください。出力は日本語のみ。説明文は不要。";
+
+/* -------------- /rewrite（方言対応） --------------
+ * 期待入力: { style: 'dialect:beranmee' | 'american_joke' | 'polite_clean'..., items:[{id,text},...] }
+ * 出力     : { results: { [id]: "変換後" } }
+ */
 app.post("/rewrite", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
-    const style  = String(req.body?.style || "polite_clean").slice(0, 200);
+    const styleRaw = String(req.body?.style || "polite_clean");
     const items  = Array.isArray(req.body?.items) ? req.body.items : [];
     const out = {};
+
+    const isDialect = styleRaw.startsWith("dialect:");
+    const dialectKey = isDialect ? (styleRaw.split(":")[1] || "beranmee") : null;
 
     for (const it of items) {
       const original = String(it?.text ?? "");
       let rewritten = "";
 
       if (OPENAI_API_KEY) {
-        // OpenAI あり：高品質変換
-        const sys = style.includes("american_joke")
-          ? "You rewrite Japanese into a short witty line with a light American-style joke. Keep meaning, no extra explanations. Output Japanese only."
-          : "You rewrite Japanese into polite, calm, natural Japanese while keeping the meaning. Soften insults and harsh words. Output Japanese only.";
-        const prompt = [
-          { role: "system", content: sys },
-          { role: "user",   content: original }
+        // OpenAIを使った高品質変換
+        let system, user;
+
+        if (isDialect) {
+          const key = DIALECTS[dialectKey] ? dialectKey : "beranmee";
+          const styleNote = DIALECTS[key];
+          system = `あなたは日本語の文体変換アシスタントです。${PLACEHOLDER_GUARD}`;
+          user   = `方言: ${key}\nスタイル指示: ${styleNote}\n---\n${original}`;
+        } else {
+          // 既存の2パターンも継続
+          const base =
+            styleRaw.includes("american_joke")
+              ? "日本語を短い軽口のウィットに富んだ一行に。意味は保ち、説明は書かない。"
+              : "日本語をていねいで落ち着いた自然な文へ言い換える。意味は保つ。";
+          system = `${base} ${PLACEHOLDER_GUARD}`;
+          user   = original;
+        }
+
+        const messages = [
+          { role: "system", content: system },
+          { role: "user",   content: user },
         ];
-        rewritten = await callOpenAIChat({ messages: prompt });
+        rewritten = await callOpenAIChat({ model: "gpt-4o-mini", messages });
       } else {
-        // OpenAI なし：ローカル変換で必ず変える
-        rewritten = style.includes("american_joke")
-          ? toAmericanJokeLine(original)
-          : softenJapanese(original);
+        // OpenAI未設定：方言変換は行えないため原文を返す（エラーにしない）
+        rewritten = original;
       }
 
-      // 念のため空なら原文
       out[it.id] = (rewritten && rewritten.trim()) ? rewritten.trim() : original;
     }
+
     res.json({ results: out });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// おまけ：Chat そのまま（必要なら）
+/* -------------- /filter（互換レイヤ） --------------
+ * 期待入力: { text: "..." , dialect?: "beranmee"|... }
+ * 出力     : { ok:true, text:"..." }
+ * クライアント互換用に軽量実装
+ */
+app.post("/filter", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    const text = String(req.body?.text || "");
+    const dialect = String(req.body?.dialect || req.body?.mode || "beranmee");
+    if (!text) return res.status(400).json({ ok: false, error: "no text" });
+
+    let out = text;
+    if (OPENAI_API_KEY) {
+      const key = DIALECTS[dialect] ? dialect : "beranmee";
+      const styleNote = DIALECTS[key];
+      const messages = [
+        { role: "system", content: `日本語の文体変換アシスタントです。${PLACEHOLDER_GUARD}` },
+        { role: "user",   content: `方言: ${key}\nスタイル指示: ${styleNote}\n---\n${text}` }
+      ];
+      out = await callOpenAIChat({ model: "gpt-4o-mini", messages });
+      out = (out && out.trim()) || text;
+    }
+    return res.json({ ok: true, text: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// おまけ：Chat そのまま
 app.post("/chat", async (req, res) => {
   if (!requireAuth(req, res)) return;
   try {
