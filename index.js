@@ -122,9 +122,9 @@ const DIALECTS = {
 const PLACEHOLDER_GUARD =
   "テキスト中のURL・@メンション・#ハッシュタグ・絵文字などのプレースホルダは削除/改変せず、位置もできるだけ保ってください。出力は日本語のみ。説明文は不要。";
 
-/* -------------- /rewrite（方言対応） --------------
- * 期待入力: { style: 'dialect:beranmee' | 'american_joke' | 'polite_clean'..., items:[{id,text},...] }
- * 出力     : { results: { [id]: "変換後" } }
+/* -------------- /rewrite（方言対応＋メタ返却） --------------
+ * 入力: { style: 'dialect:beranmee' | 'american_joke' | 'polite_clean'..., items:[{id,text},...] }
+ * 出力: { results: { [id]: "変換後" }, meta: {route, used, dialect, styleRaw} }
  */
 app.post("/rewrite", async (req, res) => {
   if (!requireAuth(req, res)) return;
@@ -132,6 +132,7 @@ app.post("/rewrite", async (req, res) => {
     const styleRaw = String(req.body?.style || "polite_clean");
     const items  = Array.isArray(req.body?.items) ? req.body.items : [];
     const out = {};
+    const meta = { route: "rewrite", used: "", dialect: null, styleRaw };
 
     const isDialect = styleRaw.startsWith("dialect:");
     const dialectKey = isDialect ? (styleRaw.split(":")[1] || "beranmee") : null;
@@ -141,16 +142,16 @@ app.post("/rewrite", async (req, res) => {
       let rewritten = "";
 
       if (OPENAI_API_KEY) {
+        meta.used = "openai";
         // OpenAIを使った高品質変換
         let system, user;
-
         if (isDialect) {
           const key = DIALECTS[dialectKey] ? dialectKey : "beranmee";
           const styleNote = DIALECTS[key];
           system = `あなたは日本語の文体変換アシスタントです。${PLACEHOLDER_GUARD}`;
           user   = `方言: ${key}\nスタイル指示: ${styleNote}\n---\n${original}`;
+          meta.dialect = key;
         } else {
-          // 既存の2パターンも継続
           const base =
             styleRaw.includes("american_joke")
               ? "日本語を短い軽口のウィットに富んだ一行に。意味は保ち、説明は書かない。"
@@ -158,30 +159,28 @@ app.post("/rewrite", async (req, res) => {
           system = `${base} ${PLACEHOLDER_GUARD}`;
           user   = original;
         }
-
         const messages = [
           { role: "system", content: system },
           { role: "user",   content: user },
         ];
         rewritten = await callOpenAIChat({ model: "gpt-4o-mini", messages });
       } else {
-        // OpenAI未設定：方言変換は行えないため原文を返す（エラーにしない）
+        meta.used = "none";  // キー未設定
         rewritten = original;
       }
 
       out[it.id] = (rewritten && rewritten.trim()) ? rewritten.trim() : original;
     }
 
-    res.json({ results: out });
+    res.json({ results: out, meta });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/* -------------- /filter（互換レイヤ） --------------
- * 期待入力: { text: "..." , dialect?: "beranmee"|... }
- * 出力     : { ok:true, text:"..." }
- * クライアント互換用に軽量実装
+/* -------------- /filter（互換レイヤ＋メタ返却） --------------
+ * 入力: { text: "..." , dialect?: "beranmee"|... }
+ * 出力: { ok:true, text:"...", meta:{route,used,dialect} }
  */
 app.post("/filter", async (req, res) => {
   if (!requireAuth(req, res)) return;
@@ -191,7 +190,10 @@ app.post("/filter", async (req, res) => {
     if (!text) return res.status(400).json({ ok: false, error: "no text" });
 
     let out = text;
+    const meta = { route: "filter", used: "", dialect };
+
     if (OPENAI_API_KEY) {
+      meta.used = "openai";
       const key = DIALECTS[dialect] ? dialect : "beranmee";
       const styleNote = DIALECTS[key];
       const messages = [
@@ -200,8 +202,10 @@ app.post("/filter", async (req, res) => {
       ];
       out = await callOpenAIChat({ model: "gpt-4o-mini", messages });
       out = (out && out.trim()) || text;
+    } else {
+      meta.used = "none";
     }
-    return res.json({ ok: true, text: out });
+    return res.json({ ok: true, text: out, meta });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
